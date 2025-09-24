@@ -53,7 +53,7 @@ def process_bronze_tables(snapshot_date_str, bronze_directories, spark):
             'date_column': 'snapshot_date'
         },
         'clickstream': {
-            'file_path': "data/features_clickstream.csv",
+            'file_path': "data/feature_clickstream.csv",
             'directory': bronze_directories['clickstream'],
             'partition_prefix': "bronze_clickstream_",
             'date_column': 'snapshot_date'
@@ -90,6 +90,7 @@ def process_bronze_tables(snapshot_date_str, bronze_directories, spark):
                         # Check if date is in M/D/YYYY format
                         F.col(config['date_column']).rlike(r'^\d{1,2}/\d{1,2}/\d{4}'
 
+
 ),
                         F.date_format(
                             F.to_date(F.col(config['date_column']), 'M/d/yyyy'),
@@ -118,8 +119,30 @@ def process_bronze_tables(snapshot_date_str, bronze_directories, spark):
                 
                 if filtered_count == 0:
                     print(f"Warning: No records found for {target_date_format} in {dataset_name}")
-                    # Optionally, you might want to continue processing with all data or skip this dataset
-                    continue
+                    
+                    # For datasets with limited date coverage, use the most recent available data
+                    if dataset_name in ['clickstream']:  # Add other datasets with limited coverage here
+                        print(f"Attempting to use most recent available data for {dataset_name}...")
+                        
+                        # Get the most recent date available in this dataset
+                        available_dates = df_with_normalized_date.select('normalized_snapshot_date').distinct()
+                        available_dates = available_dates.filter(col('normalized_snapshot_date').isNotNull())
+                        
+                        if available_dates.count() > 0:
+                            most_recent_date = available_dates.agg({"normalized_snapshot_date": "max"}).collect()[0][0]
+                            print(f"Using most recent available date: {most_recent_date}")
+                            
+                            df_filtered = df_with_normalized_date.filter(
+                                col('normalized_snapshot_date') == most_recent_date
+                            )
+                            filtered_count = df_filtered.count()
+                            print(f"Using {filtered_count} rows from {most_recent_date}")
+                        else:
+                            print(f"No valid dates found in {dataset_name}. Skipping.")
+                            continue
+                    else:
+                        # For other datasets, skip if no data for this date
+                        continue
                     
             else:
                 # If no snapshot_date column, take all data but add metadata
