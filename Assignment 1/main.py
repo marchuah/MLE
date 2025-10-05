@@ -32,8 +32,28 @@ print("=== FEATURE STORE PIPELINE STARTED ===\n")
 # Configuration
 start_date_str = "2023-01-01"
 end_date_str = "2024-12-01"
-MOB_FILTER = 6  # Month on Book for feature store and labels
+FEATURE_MOB = 0  # Features at application time (MOB=0)
+LABEL_MOB = 6    # Observe labels up to MOB=6
 DPD_THRESHOLD = 30  # Days Past Due threshold for labels
+
+# Directory configurations (defined at module level)
+bronze_directories = {
+    'lms': "datamart/bronze/lms/",
+    'financials': "datamart/bronze/financials/", 
+    'attributes': "datamart/bronze/attributes/",
+    'clickstream': "datamart/bronze/clickstream/"
+}
+
+silver_directories = {
+    'lms': "datamart/silver/lms/",
+    'financials': "datamart/silver/financials/", 
+    'attributes': "datamart/silver/attributes/",
+    'clickstream': "datamart/silver/clickstream/"
+}
+
+gold_feature_store_directory = "datamart/gold/feature_store/"
+gold_label_store_directory = "datamart/gold/label_store/"
+
 
 # Generate list of dates to process
 def generate_first_of_month_dates(start_date_str, end_date_str):
@@ -68,14 +88,6 @@ print(f"Sample dates: {dates_str_lst[:3]}...{dates_str_lst[-3:]}\n")
 # ================================
 print("=== BRONZE LAYER PROCESSING ===")
 
-# Create bronze directories for all datasets
-bronze_directories = {
-    'lms': "datamart/bronze/lms/",
-    'financials': "datamart/bronze/financials/", 
-    'attributes': "datamart/bronze/attributes/",
-    'clickstream': "datamart/bronze/clickstream/"
-}
-
 # Create directories if they don't exist
 for dir_path in bronze_directories.values():
     if not os.path.exists(dir_path):
@@ -102,14 +114,6 @@ print("Bronze layer processing completed.\n")
 # SILVER LAYER - DATA CLEANING & TRANSFORMATION
 # ================================
 print("=== SILVER LAYER PROCESSING ===")
-
-# Create silver directories for all datasets
-silver_directories = {
-    'lms': "datamart/silver/lms/",
-    'financials': "datamart/silver/financials/", 
-    'attributes': "datamart/silver/attributes/",
-    'clickstream': "datamart/silver/clickstream/"
-}
 
 # Create directories if they don't exist
 for dir_path in silver_directories.values():
@@ -140,16 +144,13 @@ print("Silver layer processing completed.\n")
 print("=== GOLD LAYER PROCESSING ===")
 
 # Create gold directories
-gold_feature_store_directory = "datamart/gold/feature_store/"
-gold_label_store_directory = "datamart/gold/label_store/"
-
 for directory in [gold_feature_store_directory, gold_label_store_directory]:
     if not os.path.exists(directory):
         os.makedirs(directory)
         print(f"Created directory: {directory}")
 
-# Run gold backfill - Feature Store
-print(f"Processing gold feature store (MOB filter: {MOB_FILTER})...")
+# Run gold backfill - Feature Store at MOB=0
+print(f"Processing gold feature store (MOB={FEATURE_MOB} - Application Time)...")
 for i, date_str in enumerate(dates_str_lst):
     print(f"Processing gold feature store for {date_str} ({i+1}/{len(dates_str_lst)})")
     try:
@@ -158,14 +159,14 @@ for i, date_str in enumerate(dates_str_lst):
             silver_directories,
             gold_feature_store_directory, 
             spark,
-            mob=MOB_FILTER
+            mob=FEATURE_MOB
         )
     except Exception as e:
         print(f"Error processing gold feature store for {date_str}: {e}")
         continue
 
-# Run gold backfill - Label Store  
-print(f"Processing gold label store ({DPD_THRESHOLD}DPD at {MOB_FILTER}MOB)...")
+# Run gold backfill - Label Store observing up to MOB=6
+print(f"Processing gold label store ({DPD_THRESHOLD}DPD within {LABEL_MOB}MOB window)...")
 for i, date_str in enumerate(dates_str_lst):
     print(f"Processing gold labels for {date_str} ({i+1}/{len(dates_str_lst)})")
     try:
@@ -175,7 +176,8 @@ for i, date_str in enumerate(dates_str_lst):
             gold_label_store_directory, 
             spark, 
             dpd=DPD_THRESHOLD, 
-            mob=MOB_FILTER
+            mob=LABEL_MOB,
+            label_type="within_window"
         )
     except Exception as e:
         print(f"Error processing gold labels for {date_str}: {e}")
@@ -206,7 +208,15 @@ if feature_files_list:
         print(f"  ... and {len(feature_df.columns) - 20} more columns")
     
     print("\nFeature Store Sample:")
-    feature_df.select("Customer_ID", "snapshot_date", "total_loans", "annual_income", "customer_age").show(5)
+    # Updated column names to match new feature store structure
+    sample_cols = ["Customer_ID", "snapshot_date"]
+    
+    # Add columns that exist
+    for col_name in ["num_active_loans_at_application", "annual_income", "customer_age"]:
+        if col_name in feature_df.columns:
+            sample_cols.append(col_name)
+    
+    feature_df.select(*sample_cols).show(5)
 else:
     print("No feature store files found!")
 
@@ -224,7 +234,7 @@ if label_files_list:
     label_distribution = label_df.groupBy("label").count().collect()
     print("Label Distribution:")
     for row in label_distribution:
-        print(f"  Label {row['label']}: {row['count']} customers")
+        print(f"  Label {row['label']}: {row['count']} ({row['count']/label_df.count()*100:.1f}%)")
     
     print("\nLabel Store Sample:")
     label_df.show(5)
@@ -257,8 +267,14 @@ print(f"Silver files processed: {len(dates_str_lst)} months × 4 datasets")
 print(f"Gold feature store files: {len(feature_files_list) if feature_files_list else 0}")
 print(f"Gold label store files: {len(label_files_list) if label_files_list else 0}")
 
+# ML Setup Validation
+print(f"\n=== ML SETUP VALIDATION ===")
+print(f"Features extracted at: MOB={FEATURE_MOB} (Application Time)")
+print(f"Labels observed within: MOB=1 to MOB={LABEL_MOB}")
+print(f"Default definition: {DPD_THRESHOLD}+ DPD anytime in observation window")
+print(f"Time separation: Predicting {LABEL_MOB} months into the future")
+
 # Cleanup
 spark.stop()
 
 print("\n=== FEATURE STORE PIPELINE COMPLETED ===")
-print("Ready for Assignment 2: Machine Learning Model Training!")

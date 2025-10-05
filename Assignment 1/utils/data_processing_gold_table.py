@@ -15,11 +15,18 @@ from pyspark.sql.functions import col, when, coalesce, lit, max as spark_max, mi
 from pyspark.sql.types import StringType, IntegerType, FloatType, DateType, DoubleType
 
 
-def process_gold_feature_store(snapshot_date_str, silver_directories, gold_feature_store_directory, spark, mob=None):
+def process_gold_feature_store(snapshot_date_str, silver_directories, gold_feature_store_directory, spark, mob=0):
     """
-    Create gold feature store by combining and aggregating all silver tables
+    Create gold feature store for MOB=0 (application time) prediction
+    
+    Business Case: Predict if customer will default using only 
+    information available at MOB=0 (loan application time)
+    
+    Args:
+        mob: Filter to specific MOB for features. Use 0 for application-time features.
     """
     print(f"Processing gold feature store for snapshot date: {snapshot_date_str}")
+    print(f"Feature MOB filter: {mob} (Application Time)")
     
     # Handle date format
     try:
@@ -53,24 +60,22 @@ def process_gold_feature_store(snapshot_date_str, silver_directories, gold_featu
             print(f"Error loading {dataset_name}: {str(e)}")
             continue
     
-    # Start with LMS data as the base (if available) or use any dataset with Customer_ID
+    # Start with LMS data filtered to MOB=0 (application time)
     base_df = None
     
     if 'lms' in silver_dfs:
-        base_df = silver_dfs['lms']
-        
-        # Filter by MOB if specified (for label creation compatibility)
-        if mob is not None:
-            base_df = base_df.filter(col("mob") == mob)
-            print(f"Filtered LMS data to MOB {mob}, row count: {base_df.count()}")
+        # CRITICAL: Filter to MOB=0 only for application-time features
+        base_df = silver_dfs['lms'].filter(col("mob") == mob)
+        print(f"Filtered LMS data to MOB={mob}, row count: {base_df.count()}")
     
-    # If no LMS data, start with attributes or financials
-    elif 'attributes' in silver_dfs:
-        base_df = silver_dfs['attributes'].select("Customer_ID", "snapshot_date").distinct()
-    elif 'financials' in silver_dfs:
-        base_df = silver_dfs['financials'].select("Customer_ID", "snapshot_date").distinct()
-    elif 'clickstream' in silver_dfs:
-        base_df = silver_dfs['clickstream'].select("Customer_ID", "snapshot_date").distinct()
+    # If no LMS data at MOB=0, start with other sources
+    if base_df is None or base_df.count() == 0:
+        if 'attributes' in silver_dfs:
+            base_df = silver_dfs['attributes'].select("Customer_ID", "snapshot_date").distinct()
+        elif 'financials' in silver_dfs:
+            base_df = silver_dfs['financials'].select("Customer_ID", "snapshot_date").distinct()
+        elif 'clickstream' in silver_dfs:
+            base_df = silver_dfs['clickstream'].select("Customer_ID", "snapshot_date").distinct()
     
     if base_df is None:
         raise Exception("No valid silver tables found to create gold feature store")
@@ -79,16 +84,16 @@ def process_gold_feature_store(snapshot_date_str, silver_directories, gold_featu
     customers_df = base_df.select("Customer_ID", "snapshot_date").distinct()
     print(f"Found {customers_df.count()} unique customers for feature engineering")
     
-    # Build comprehensive feature set
+    # Build comprehensive feature set (all at MOB=0)
     feature_df = customers_df
     
-    # Add LMS features
+    # Add LMS features (historical loan behavior at application time)
     if 'lms' in silver_dfs:
-        lms_features = create_lms_features(silver_dfs['lms'], mob)
+        lms_features = create_lms_features_mob0(silver_dfs['lms'], mob)
         feature_df = feature_df.join(lms_features, "Customer_ID", "left")
-        print("Added LMS features")
+        print("Added LMS features (MOB=0 historical data)")
     
-    # Add financial features
+    # Add financial features (snapshot at application time)
     if 'financials' in silver_dfs:
         financial_features = create_financial_features(silver_dfs['financials'])
         feature_df = feature_df.join(financial_features, "Customer_ID", "left")
@@ -100,7 +105,7 @@ def process_gold_feature_store(snapshot_date_str, silver_directories, gold_featu
         feature_df = feature_df.join(attribute_features, "Customer_ID", "left")
         print("Added Attribute features")
     
-    # Add clickstream features  
+    # Add clickstream features (pre-application behavior)
     if 'clickstream' in silver_dfs:
         clickstream_features = create_clickstream_features(silver_dfs['clickstream'])
         feature_df = feature_df.join(clickstream_features, "Customer_ID", "left")
@@ -109,19 +114,14 @@ def process_gold_feature_store(snapshot_date_str, silver_directories, gold_featu
     # Add gold metadata
     feature_df = feature_df.withColumn('gold_processing_timestamp', F.current_timestamp()) \
                           .withColumn('gold_processing_date', lit(snapshot_date_str)) \
-                          .withColumn('feature_store_version', lit('1.0'))
-    
-    if mob is not None:
-        feature_df = feature_df.withColumn('mob_filter', lit(mob))
+                          .withColumn('feature_store_version', lit('1.0')) \
+                          .withColumn('feature_mob', lit(mob))
     
     print(f"Final feature store shape: {feature_df.count()} rows, {len(feature_df.columns)} columns")
     print(f"Feature columns: {feature_df.columns}")
     
     # Save gold feature store
     partition_name = f"gold_feature_store_{date_suffix}.parquet"
-    if mob is not None:
-        partition_name = f"gold_feature_store_{mob}mob_{date_suffix}.parquet"
-        
     filepath = gold_feature_store_directory + partition_name
     feature_df.write.mode("overwrite").parquet(filepath)
     print(f'Saved gold feature store to: {filepath}')
@@ -129,51 +129,50 @@ def process_gold_feature_store(snapshot_date_str, silver_directories, gold_featu
     return feature_df
 
 
-def create_lms_features(lms_df, mob=None):
+def create_lms_features_mob0(lms_df, mob=0):
     """
-    Create aggregated features from LMS loan data
-    """
-    print("Creating LMS features...")
+    Create features from LMS data at MOB=0 (application time)
     
-    # Customer-level loan aggregations
-    lms_features = lms_df.groupBy("Customer_ID").agg(
-        count("loan_id").alias("total_loans"),
-        spark_max("loan_amt").alias("max_loan_amount"),
-        spark_min("loan_amt").alias("min_loan_amount"),
-        spark_mean("loan_amt").alias("avg_loan_amount"),
-        spark_max("tenure").alias("max_tenure"),
-        spark_mean("tenure").alias("avg_tenure"),
-        spark_max("balance").alias("current_total_balance"),
-        spark_mean("balance").alias("avg_balance"),
-        spark_max("overdue_amt").alias("max_overdue_amount"),
-        spark_mean("overdue_amt").alias("avg_overdue_amount"),
-        spark_max("dpd").alias("max_dpd"),
-        spark_mean("dpd").alias("avg_dpd"),
-        spark_max("mob").alias("max_mob"),
-        spark_mean("paid_amt").alias("avg_paid_amount")
+    Key Point: At MOB=0, we capture:
+    - Current loan application details (amount, tenure requested)
+    - Historical performance on PAST loans (if repeat customer)
+    - NO future performance data from this loan
+    """
+    print("Creating LMS features at MOB=0...")
+    
+    # Filter to MOB=0 only
+    lms_mob0 = lms_df.filter(col("mob") == mob)
+    
+    # Application-time loan characteristics (what they're applying for NOW)
+    lms_features = lms_mob0.groupBy("Customer_ID").agg(
+        count("loan_id").alias("num_active_loans_at_application"),
+        spark_max("loan_amt").alias("max_requested_loan_amount"),
+        spark_mean("loan_amt").alias("avg_requested_loan_amount"),
+        spark_max("tenure").alias("max_requested_tenure"),
+        spark_mean("tenure").alias("avg_requested_tenure"),
+        # At MOB=0, balance should equal loan amount (just disbursed)
+        spark_max("balance").alias("initial_total_balance"),
+        spark_mean("balance").alias("avg_initial_balance")
     )
     
-    # Add derived features
-    lms_features = lms_features.withColumn("total_loan_exposure", 
-                                          col("total_loans") * col("avg_loan_amount"))
+    # Add derived application-time features
+    lms_features = lms_features.withColumn("total_loan_exposure_at_application", 
+                                          col("num_active_loans_at_application") * col("avg_requested_loan_amount"))
     
-    lms_features = lms_features.withColumn("utilization_ratio",
-                                          when(col("avg_loan_amount") > 0,
-                                               col("avg_balance") / col("avg_loan_amount"))
-                                          .otherwise(0))
+    # Flag for multiple simultaneous loan applications
+    lms_features = lms_features.withColumn("multiple_loans_flag",
+                                          when(col("num_active_loans_at_application") > 1, 1).otherwise(0))
     
-    lms_features = lms_features.withColumn("delinquency_flag",
-                                          when(col("max_dpd") > 0, 1).otherwise(0))
-    
-    lms_features = lms_features.withColumn("high_risk_flag",
-                                          when(col("max_dpd") >= 30, 1).otherwise(0))
+    # High value application flag
+    lms_features = lms_features.withColumn("high_value_application",
+                                          when(col("max_requested_loan_amount") >= 50000, 1).otherwise(0))
     
     return lms_features
 
 
 def create_financial_features(financial_df):
     """
-    Create features from financial data
+    Create features from financial data (snapshot at application time)
     """
     print("Creating Financial features...")
     
@@ -184,7 +183,7 @@ def create_financial_features(financial_df):
         col("Monthly_Inhand_Salary").alias("monthly_salary"),
         col("Num_Bank_Accounts").alias("num_bank_accounts"),
         col("Num_Credit_Card").alias("num_credit_cards"),
-        col("Interest_Rate").alias("avg_interest_rate"),
+        col("Interest_Rate").alias("existing_avg_interest_rate"),
         col("Num_of_Loan").alias("external_loans_count"),
         col("Outstanding_Debt").alias("total_outstanding_debt"),
         col("Credit_Utilization_Ratio").alias("credit_utilization"),
@@ -216,6 +215,27 @@ def create_financial_features(financial_df):
         .otherwise(0)
     )
     
+    # Add savings capacity indicator
+    financial_features = financial_features.withColumn("discretionary_income",
+        col("monthly_salary") - col("monthly_emi")
+    )
+    
+    financial_features = financial_features.withColumn("savings_capacity_ratio",
+        when(col("monthly_salary") > 0,
+             col("discretionary_income") / col("monthly_salary"))
+        .otherwise(0)
+    )
+    
+    # Credit portfolio diversity
+    financial_features = financial_features.withColumn("credit_product_diversity",
+        col("num_bank_accounts") + col("num_credit_cards") + col("external_loans_count")
+    )
+    
+    # High leverage flag
+    financial_features = financial_features.withColumn("high_leverage_flag",
+        when(col("debt_to_income_ratio") > 0.7, 1).otherwise(0)
+    )
+    
     return financial_features
 
 
@@ -241,13 +261,24 @@ def create_attribute_features(attributes_df):
         .otherwise("senior")
     )
     
-    # Create occupation-based risk flags (example categorization)
-    high_stability_occupations = ['Lawyer', 'Engineer', 'Doctor', 'Teacher']
+    # Create occupation-based stability score
+    high_stability_occupations = ['Lawyer', 'Engineer', 'Doctor', 'Teacher', 'Accountant', 'Scientist']
+    medium_stability_occupations = ['Manager', 'Architect', 'Developer', 'Analyst']
     
     attribute_features = attribute_features.withColumn("occupation_stability_score",
         when(col("occupation").isin(high_stability_occupations), 5)
-        .when(col("occupation").isNotNull(), 3)
+        .when(col("occupation").isin(medium_stability_occupations), 3)
+        .when(col("occupation").isNotNull(), 2)
         .otherwise(1)
+    )
+    
+    # Age-based maturity score
+    attribute_features = attribute_features.withColumn("financial_maturity_score",
+        when((col("customer_age") >= 30) & (col("customer_age") <= 55), 5)
+        .when((col("customer_age") >= 25) & (col("customer_age") < 30), 4)
+        .when((col("customer_age") >= 56) & (col("customer_age") <= 65), 4)
+        .when(col("customer_age") < 25, 2)
+        .otherwise(3)
     )
     
     return attribute_features
@@ -255,7 +286,7 @@ def create_attribute_features(attributes_df):
 
 def create_clickstream_features(clickstream_df):
     """
-    Create features from clickstream data
+    Create features from clickstream data (pre-application browsing behavior)
     """
     print("Creating Clickstream features...")
     
@@ -277,14 +308,40 @@ def create_clickstream_features(clickstream_df):
         .otherwise("low")
     )
     
+    # Add engagement quality score
+    clickstream_features = clickstream_features.withColumn("engagement_quality_score",
+        when(col("clickstream_balance_ratio") >= 0.8, 5)
+        .when(col("clickstream_balance_ratio") >= 0.6, 4)
+        .when(col("clickstream_balance_ratio") >= 0.4, 3)
+        .when(col("clickstream_balance_ratio") >= 0.2, 2)
+        .otherwise(1)
+    )
+    
+    # Pre-application research indicator
+    clickstream_features = clickstream_features.withColumn("thorough_researcher",
+        when((col("clickstream_positive_activity") >= 50) & 
+             (col("clickstream_balance_ratio") >= 0.6), 1).otherwise(0)
+    )
+    
     return clickstream_features
 
 
-def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd, mob):
+def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd, mob, label_type="within_window"):
     """
-    Legacy function to create labels (separate from feature store)
+    Create labels for model training
+    Labels come from FUTURE loan performance observation
+    
+    Args:
+        dpd: Days past due threshold (e.g., 30 for default definition)
+        mob: Observation window in months (e.g., 6 means observe up to MOB=6)
+        label_type: "within_window" (default anytime in MOB 1-6) or "at_mob" (only at specific MOB)
+    
+    Business Cases:
+    - "within_window": Label=1 if customer defaults ANYTIME within observation window
+    - "at_mob": Label=1 if customer is in default specifically at the target MOB
     """
-    print(f"Processing gold label store for {dpd}DPD at {mob}MOB")
+    print(f"Processing gold label store for {dpd}DPD within {mob}MOB window")
+    print(f"Label type: {label_type}")
     
     # Handle date format
     try:
@@ -300,20 +357,39 @@ def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, go
     df = spark.read.parquet(filepath)
     print(f'Loaded from: {filepath}, row count: {df.count()}')
 
-    # Filter to specific MOB
-    df = df.filter(col("mob") == mob)
+    if label_type == "within_window":
+        # Label = 1 if customer EVER defaults within the observation window (MOB 1 to mob)
+        print(f"Creating labels: Default anytime between MOB=1 and MOB={mob}")
+        df_window = df.filter((col("mob") >= 1) & (col("mob") <= mob))
+        
+        # For each customer-loan, check if they ever hit the DPD threshold
+        df_labels = df_window.groupBy("loan_id", "Customer_ID", "snapshot_date").agg(
+            spark_max(when(col("dpd") >= dpd, 1).otherwise(0)).alias("label")
+        )
+        
+        df_labels = df_labels.withColumn("label_def", 
+                                        lit(f"{dpd}dpd_within_{mob}mob").cast(StringType()))
+        
+    else:  # "at_mob"
+        # Label = 1 if customer is in default at the specific MOB
+        print(f"Creating labels: Default status at MOB={mob}")
+        df = df.filter(col("mob") == mob)
+        df_labels = df.withColumn("label", 
+                                  when(col("dpd") >= dpd, 1).otherwise(0).cast(IntegerType()))
+        df_labels = df_labels.withColumn("label_def", 
+                                        lit(f"{dpd}dpd_at_{mob}mob").cast(StringType()))
+        df_labels = df_labels.select("loan_id", "Customer_ID", "label", "label_def", "snapshot_date")
 
-    # Create label
-    df = df.withColumn("label", when(col("dpd") >= dpd, 1).otherwise(0).cast(IntegerType()))
-    df = df.withColumn("label_def", lit(f"{dpd}dpd_{mob}mob").cast(StringType()))
-
-    # Select columns for label store
-    df = df.select("loan_id", "Customer_ID", "label", "label_def", "snapshot_date")
+    # Print label distribution
+    label_dist = df_labels.groupBy("label").count()
+    print("Label distribution:")
+    label_dist.show()
 
     # Save gold label store
+
     partition_name = f"gold_label_store_{dpd}dpd_{mob}mob_{date_suffix}.parquet"
     filepath = gold_label_store_directory + partition_name
-    df.write.mode("overwrite").parquet(filepath)
+    df_labels.write.mode("overwrite").parquet(filepath)
     print(f'Saved to: {filepath}')
 
-    return df
+    return df_labels
