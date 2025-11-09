@@ -1,0 +1,10 @@
+numpy<2.0.0
+pandas<2.0.0
+matplotlib
+seaborn
+scipy
+scikit-learn
+pyspark
+xgboost
+lightgbm
+fastparquet
